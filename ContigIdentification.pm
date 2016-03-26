@@ -8,6 +8,7 @@ use HVtools::PhylogeneticTree;
 
 use Bio::SeqIO;
 use Bio::TreeIO;
+use Bio::SeqFeature::Generic;
 use File::Spec;
 use Cwd;
 
@@ -15,7 +16,109 @@ use Exporter qw(import);
 our @ISA =   qw(Exporter);
 our @EXPORT = qw(
 	taxonomic_identification_of_contig_by_phylogenomic_analysis
+	annotate_contig_with_prodigal_and_blast
 );
+
+
+# annotates contig by running prodigal to find ORFs and blast searches against reference database
+sub annotate_contig_with_prodigal_and_blast {
+	my $contig_file = shift;
+	my $seqDB_dir = shift;
+	my $output_dir = shift;
+	
+	print "\nRunning function annotate_contig_with_prodigal_and_blast from HVtools::ContigIdentification\n";
+
+	# check command line dependencies
+		my $exe = find_executables(["prodigal","blastp"]);
+		print "\nExecutables:\n",format_hash($exe,2);
+
+	# get file and directory names formatted as absolute path
+		my $home = getcwd;
+		$contig_file = File::Spec->rel2abs($contig_file);
+		chdir($seqDB_dir); $seqDB_dir = getcwd;
+		chdir($home);
+		unless (-e $output_dir) {mkdir($output_dir)}
+		chdir($output_dir); $output_dir = getcwd;
+
+	# run prodigal to identify CDSs
+		print "\nRunning prodigal to extract CDSs from contig.\n";
+		my $cmd = $exe->{"prodigal"}." -i $contig_file -d prodigal_nt.fas -a prodigal_aa.fas -o prodigal_gb.gb -p meta";
+		print "  running command in ",getcwd,"\n";
+		print "  $cmd\n";
+		system("$cmd 1> prodigal_screenout.txt 2> prodigal_screenout.txt");
+		print "  Done.\n";
+
+	# BLAST CDSs from contig against reference database
+		print "\nBLASTing CDSs from contig against reference database.\n";
+		$cmd = $exe->{"blastp"}." -max_target_seqs 1 -query prodigal_aa.fas -evalue 0.0000000001 -db $seqDB_dir\/blastdb_aa -outfmt \"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen\" -out blast_results.txt";
+		print "  running command in ",getcwd,"\n";
+		print "  $cmd\n";
+		system("$cmd 1> blast_screenout.txt 2> blast_screenout.txt");
+		print "  Done.\n";
+
+	# interpret BLAST results
+		print "\nInterpreting BLAST results.\n";
+		my $hits;
+		open FH,"blast_results.txt";
+		while (my $line = <FH>) {
+			$line =~ s/[\r\n]//g;
+			my @a = split /\t/,$line;
+			if ($a[12]/$a[3] > 0.75) {  # query coverage must be 75% or above
+				$a[1] =~ /^(.*?)\|/;
+				my $gene = $1;
+				$hits->{$a[0]} = $gene;
+			}
+		}
+		close FH;
+		print "  Contig gave BLAST hits for ",scalar(keys %$hits)," genes.\n";
+
+	# exit if no blast hits
+		if (scalar(keys %$hits) < 1) {
+			print "\nNo BLAST hits. Probably not a chloroplast sequence. Terminating execution.\n"; exit;
+		}
+
+	# add features to contig sequence
+		print "\nAdding identified features to sequence object.\n";
+		my $seq = Bio::SeqIO->new(-file => $contig_file, -format => 'fasta')->next_seq;
+		my $prodigal_nt_seqio = Bio::SeqIO->new(-file => "prodigal_nt.fas", -format => "fasta");
+		my $counter = 0;
+		my $counter2 = 0;
+		while (my $prodseq = $prodigal_nt_seqio->next_seq) {
+			my $id = $prodseq->id;
+			my $primtag = "CDS";
+			my $evidence = "predicted: prodigal ORF";
+			my $name = "prodigal_ORF_"; $id =~ /_(\d+)$/; $name .= $1;
+			my $desc = $prodseq->desc; $desc =~ s/^#\s//;
+			my @a = split /\s#\s/,$desc;
+			if ($hits->{$id}) {
+				$name = $hits->{$id};
+				$evidence = "predicted: prodigal ORF, BLASTP annotated";
+				++$counter2;
+			}
+			my $start = $a[0];
+			my $end = $a[1];
+			my $strand = $a[2];
+			my $feat = new Bio::SeqFeature::Generic(
+				-start       => $start,
+				-end         => $end,
+				-strand      => $strand,
+				-primary_tag => $primtag,
+				-tag => {evidence => $evidence, name => $name}
+				);
+			if ($hits->{$id}) {
+				$feat->add_tag_value('gene',$hits->{$id});
+			}
+			$seq->add_SeqFeature($feat);
+			++$counter;
+		}
+		print "  Added $counter annotations of which $counter2 were identified by BLASTP.\n  Done.\n";
+
+	# saving annotated sequence
+		print "\nSaving annotated sequence to annotated_sequence.gb.\n";
+		my $out = Bio::SeqIO->new(-file => ">annotated_sequence.gb", -format => 'genbank');
+		$out->write_seq($seq);
+		print "  Done.\n";
+}
 
 # identifies contig taxonomically by phylogenomic comparison to reference dataset
 sub taxonomic_identification_of_contig_by_phylogenomic_analysis {
